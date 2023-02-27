@@ -1,0 +1,728 @@
+
+SELECT 
+		PRA.prc_ID		AS ID_Pracownika
+	,	PRA.prc_Opis	AS Stanowisko
+	,	PRA.prc_Nazwa	AS Pracownik
+INTO	-- SELECT * FROM
+		#PracownicyDT --WHERE ID_pracownika = 5706
+FROM	-- SELECT TOP 10 * FROM
+		 Baza_system.dbo._Pracownik				AS PRA
+	JOIN Baza_system.dbo._WBWindykatorBezposredni	AS WBE ON WBE.wbw_IDPracownik = PRA.prc_ID
+																		AND wbw_JestWindykatorem = 1
+WHERE 
+		PRA.prc_Usuniety = 0
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- budowanie tabeli z listą Pracowników CC_KRUK
+
+/*
+SELECT
+		PRA.prc_ID		AS ID_Pracownika
+	,	PRA.prc_Opis	AS Stanowisko
+	,	PRA.prc_Nazwa	AS Pracownik
+INTO	-- SELECT * FROM
+		#Pracownicy_CC_KRUK
+FROM
+		Baza_system.dbo._Pracownik	AS PRA
+WHERE 
+		emp_MPK = 2059
+	AND PRA.prc_Usuniety = 0
+*/
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Budowanie tabeli z sprawami
+
+SELECT 
+		SPR.spr_ID
+	,	SPR.spr_CalyNumerSprawy
+	,	CAST(spr_DataImportu AS date)							AS DataImportu
+	,	ISNULL(NOV.nov_AgreementNumber, CDB.ContractNumber)		AS NumerUmowy
+	,	CASE	-- powinny być tu opisane wszystkie bazy zawarte w WHERE
+			WHEN SPR.spr_IDBaza IN (412, 509, 947)	THEN 'NOVUM'
+			WHEN SPR.spr_IDBaza IN (10, 30)			THEN 'PROVIDENT'
+			ELSE 'Sprawdź warunek w kodzie'
+		END AS CzyjaSprawa
+INTO	-- DROP TABLE #Sprawy	-- SELECT * FROM
+		#Sprawy		--	WHERE NumerUmowy = 'DT/000202976/002'
+FROM	-- SELECT TOP 10 * FROM
+				Baza_system.dbo._Sprawa					AS SPR
+	LEFT JOIN	Baza_system.dbo._Case_NOVUM				AS NOV	WITH(NOLOCK)	ON	SPR.spr_ID = NOV.nov_ID
+	LEFT JOIN	Baza_system.dbo._ClientData_Basic			AS CDB	WITH(NOLOCK)	ON	SPR.spr_ID = CDB.CaseId
+WHERE
+		SPR.spr_IDBaza IN (412, 509, 947)--, 10, 30) -- 412 NOVUM / 509 NOVUM - Skip / 947 NOVUM NEW / 10 Provident / 30 Provident Polska SA
+	AND SPR.spr_IsSelectedToBeDeleted = 0 -- kiedyś testowali elementy na produkcji i przez to tworzą się duplikaty
+	AND	SPR.spr_DataImportu >= DATEADD(yy, DATEDIFF(yy, 0, GETDATE()) -2, 0) -- funkcja wyciągająca datę początku roku z dwóch lat wstecz np. jeżli dzisiaj jest 20-06-2022 to wynik będzie 01-01-2020
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- dołączenie do spraw bucketów i kanału sprzedaży
+
+SELECT 
+		SPR.*
+	,	PDS.KanalSprzedazy
+	,	PDS.Bucket
+	,	PDS.BucketBin
+INTO	-- DROP TABLE #SprawyBucket	-- SELECT * FROM
+		#SprawyBucket	--WHERE spr_ID = 24233411
+FROM
+				#Sprawy AS SPR
+	OUTER APPLY	(
+				SELECT TOP 1 *	--	SELECT TOP 10 *
+				FROM NaszaBaza.novum.ANA_TB_220244_MonitoringWindykacyjnyNovum_Buckety	AS MWN	WITH(NOLOCK)
+				WHERE MWN.Number = NumerUmowy
+				ORDER BY DataKalendarza DESC
+				) AS PDS
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- budowanie tabeli telefonami, które wykonali CC
+
+SELECT 
+		CAST(ISNULL(ZDA.zdn_DataZdarzenia, ZDA.zdn_DataWpisu) AS date) AS DataZdarzenia
+	,	SPR.spr_ID
+	,	SPR.spr_CalyNumerSprawy
+	,	ZDA.zdn_NdsIdKategoria
+	,	ZDA.zdn_NdsIdOsobaWZdarzeniu
+	,	ZDA.zdn_NdsIdTypZdarzenia
+	,	ZDA.zdn_NdsIdRozszerzenie
+	,	1 AS Próby		-- później będziemy agregować per sprawa ile było prób ile dotarć ile sukcesów
+	,	CASE
+			WHEN ZDA.zdn_NdsIdOsobaWZdarzeniu = 'DL'
+			THEN 1
+			ELSE 0
+		END AS Dotarcie
+	,	CASE
+			WHEN ZDA.zdn_NdsIdOsobaWZdarzeniu = 'DL' AND zdn_NdsIdTypZdarzenia IN ('DSP','UST')
+			THEN 1
+			ELSE 0
+		END AS Sukces
+INTO	-- DROP TABLE #TelefonyCC	-- SELECT * FROM
+		#TelefonyCC --WHERE spr_ID = 24233411
+FROM 
+			#Sprawy										AS SPR
+	JOIN	Baza_system.dbo._Zdarzenie			AS ZDA		WITH(NOLOCK)	ON SPR.spr_ID = ZDA.zdn_IDSprawa
+WHERE
+		ZDA.zdn_NdsIdKategoria IN ('TW', 'TP') -- TW - telefon wychodzący / TP = telefon przychodzący
+	AND ZDA.zdn_NdsIdOsobaWZdarzeniu IN ('DL','OP','ON','TZN')
+	AND EXISTS (SELECT PRA.ID_Pracownika FROM #PracownicyDT AS PRA WHERE PRA.ID_Pracownika = ZDA.zdn_IDPracownik)
+	AND ZDA.zdn_Automatyczny = 0
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- budowanie tabeli telefonami, które wykonali DT
+
+SELECT 
+		CAST(ISNULL(ZDA.zdn_DataZdarzenia, ZDA.zdn_DataWpisu) AS date) AS DataZdarzenia
+	,	SPR.spr_ID
+	,	SPR.spr_CalyNumerSprawy
+	,	ZDA.zdn_NdsIdKategoria
+	,	ZDA.zdn_NdsIdOsobaWZdarzeniu
+	,	ZDA.zdn_NdsIdTypZdarzenia
+	,	ZDA.zdn_NdsIdRozszerzenie
+	,	1 AS Próby		-- później będziemy agregować per sprawa ile było prób ile dotarć ile sukcesów
+	,	CASE
+			WHEN ZDA.zdn_NdsIdOsobaWZdarzeniu = 'DL'
+			THEN 1
+			ELSE 0
+		END AS Dotarcie
+	,	CASE
+			WHEN ZDA.zdn_NdsIdOsobaWZdarzeniu = 'DL' AND zdn_NdsIdTypZdarzenia IN ('DSP','UST')
+			THEN 1
+			ELSE 0
+		END AS Sukces
+INTO	-- DROP TABLE #TelefonyDT	-- SELECT * FROM
+		#TelefonyDT	--WHERE spr_ID = 24233411
+FROM 
+			#Sprawy										AS SPR
+	JOIN	Baza_system.dbo._Zdarzenie			AS ZDA		WITH(NOLOCK)	ON SPR.spr_ID = ZDA.zdn_IDSprawa
+WHERE
+		ZDA.zdn_NdsIdKategoria IN ('TW', 'TP') -- TW - telefon wychodzący / TP = telefon przychodzący
+	AND ZDA.zdn_NdsIdOsobaWZdarzeniu IN ('DL','OP','ON','TZN')
+	AND NOT EXISTS (SELECT NULL FROM #PracownicyDT AS PRA WHERE PRA.ID_Pracownika = ZDA.zdn_IDPracownik)
+	AND ZDA.zdn_Automatyczny = 0
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- budowanie tabeli z wizytami DT
+
+SELECT 
+		CAST(ISNULL(ZDA.zdn_DataZdarzenia, ZDA.zdn_DataWpisu) AS date) AS DataZdarzenia
+	,	SPR.spr_ID
+	,	SPR.spr_CalyNumerSprawy
+	,	ZDA.zdn_NdsIdKategoria
+	,	ZDA.zdn_NdsIdOsobaWZdarzeniu
+	,	ZDA.zdn_NdsIdTypZdarzenia
+	,	ZDA.zdn_NdsIdRozszerzenie
+	,	1 AS Próby		-- później będziemy agregować per sprawa ile było prób ile dotarć ile sukcesów
+	,	CASE
+			WHEN ZDA.zdn_NdsIdOsobaWZdarzeniu = 'DL'
+			THEN 1
+			ELSE 0
+		END AS Dotarcie
+	,	CASE
+			WHEN ZDA.zdn_NdsIdOsobaWZdarzeniu = 'DL' AND zdn_NdsIdTypZdarzenia IN ('DSP','UST')
+			THEN 1
+			ELSE 0
+		END AS Sukces
+	--,	ZDA.*
+INTO	--	DROP TABLE #WizytyDT -- SELECT * FROM
+		#WizytyDT		--where spr_CalyNumerSprawy = 'NOVUM_NEW/385/21'
+FROM 
+			#Sprawy										AS SPR
+	JOIN	Baza_system.dbo._Zdarzenie			AS ZDA		WITH(NOLOCK)	ON SPR.spr_ID = ZDA.zdn_IDSprawa
+WHERE
+		ZDA.zdn_NdsIdKategoria = 'WB' -- WB - wizyta bezpośrednia
+	AND ZDA.zdn_NdsIdOsobaWZdarzeniu IN ('DL','OP','ON','TZN')
+	AND ZDA.zdn_Automatyczny = 0
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Tabela z pobrami gotówki
+
+SELECT
+		CPT.EmployeeId				AS ID_Pracownika
+	,	CAST(CPT.TaskDate AS date)	AS DataPobrania
+	,	'Pobór karta'				AS Zdarzenie
+    ,	CPT.DebtorId				AS ID_Klienta
+	,	CPD.CaseId					AS ID_Sprawa
+	,	SPR.spr_CalyNumerSprawy		AS NumerSprawy	
+	,	CPD.Amount					AS Wartosc
+INTO	-- DROP TABLE #Pobory	-- SELECT * FROM
+	#Pobory
+FROM	-- select top 100 * from
+				Baza_system.dbo._DelfinMobile_CardPaymentTask			AS CPT
+	LEFT JOIN	Baza_system.dbo._DelfinMobile_CardPaymentTaskDetails	AS CPD ON CPT.Id = CPD.CardPaymentTaskId
+	JOIN		#Sprawy															AS SPR	ON SPR.spr_ID = CPD.CaseId
+WHERE
+	CPD.Amount > 0
+	AND	CPT.TaskDate >= DATEADD(yy, DATEDIFF(yy, 0, GETDATE()) -2, 0) -- funkcja wyciągająca datę początku roku z dwóch lat wstecz np. jeżli dzisiaj jest 20-06-2022 to wynik będzie 01-01-2020
+
+UNION ALL
+
+SELECT
+		wbw_IDPracownik			AS ID_Pracownika
+	,	CAST(wbu_Data AS date)	AS DataPobrania
+	,	'Pobór gotówka'			AS Zdarzenie
+	,	swb_IDDluznik			AS ID_Klienta
+	,	swb_IDSprawa			AS ID_Sprawa
+	,	SPR.spr_CalyNumerSprawy	AS NumerSprawy	
+	,	wbu_PobranoGotowke		AS Wartosc
+	
+  FROM -- select top 100 * from
+				Baza_system.dbo._WBUstalenia				AS WBU 
+  INNER JOIN	Baza_system.dbo._WBUstalenia_Lista			AS WBL ON WBU.wbu_IDUstalenie = WBL.wbu_ID
+  LEFT JOIN		Baza_system.dbo._Sprawa_WB					AS SWB ON wbu_IDSprawaWB = swb_ID
+  LEFT JOIN		Baza_system.dbo._WBWindykatorBezposredni	AS WBW ON wbu_IDWindykator = wbw_ID
+  JOIN			#Sprawy												AS SPR	ON SPR.spr_ID = swb_IDSprawa
+WHERE
+	wbu_PobranoGotowke > 0
+	AND	wbu_Data >= DATEADD(yy, DATEDIFF(yy, 0, GETDATE()) -2, 0) -- funkcja wyciągająca datę początku roku z dwóch lat wstecz np. jeżli dzisiaj jest 20-06-2022 to wynik będzie 01-01-2020
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Tabela z  określeniem przelewów, które miały miejscie 7 dni od zdarzenia
+
+SELECT
+		WOS.spr_ID
+	,	WOS.spr_CalyNumerSprawy
+	,	WOS.pay_ID
+	,	WOS.pay_PaymentAmount
+	,	WOS.pay_PaymentDate
+	,	CASE
+			WHEN EXISTS(SELECT NULL 
+						FROM #WizytyDT AS WDT 
+						WHERE WDT.spr_ID = WOS.spr_ID
+							AND DATEDIFF(day, WDT.DataZdarzenia, WOS.pay_PaymentDate) >= 7
+						)
+			THEN 1
+			ELSE 0
+		END AS CzyWplata_7DniOdWB
+INTO	-- DROP TABLE #Wplaty_7dni	-- SELECT * FROM
+	#Wplaty_7dni
+FROM 
+		 NaszaBaza.novum.ANA_TB_227195_WplatyHK_obaSystemy	AS WOS
+	JOIN #Sprawy												AS SPR ON SPR.spr_ID = WOS.spr_ID
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Połączenie danych spraw i bucketów z danymi dotyczącymi telefonów, wizyt, poborów i wpłat (RAPORT)
+
+TRUNCATE TABLE NaszaBaza.sec.ANA_TB_237390_DT_EfektywnoscDzialan
+INSERT INTO		-- SELECT * FROM
+		NaszaBaza.sec.ANA_TB_237390_DT_EfektywnoscDzialan
+
+SELECT
+		SB.*
+	,	(SELECT ISNULL(SUM(TDT.Próby), 0)				FROM #TelefonyDT	AS TDT WHERE TDT.spr_ID = SB.spr_ID)	AS ProbyTel_DT
+	,	(SELECT ISNULL(SUM(TDT.Dotarcie), 0)			FROM #TelefonyDT	AS TDT WHERE TDT.spr_ID = SB.spr_ID)	AS DotarcieTel_DT
+	,	(SELECT ISNULL(SUM(TDT.Sukces), 0)				FROM #TelefonyDT	AS TDT WHERE TDT.spr_ID = SB.spr_ID)	AS SukcesTel_DT
+	,	(SELECT ISNULL(SUM(TCC.Próby), 0)				FROM #TelefonyCC	AS TCC WHERE TCC.spr_ID = SB.spr_ID)	AS ProbyTel_CC
+	,	(SELECT ISNULL(SUM(TCC.Dotarcie), 0)			FROM #TelefonyCC	AS TCC WHERE TCC.spr_ID = SB.spr_ID)	AS DotarcieTel_CC
+	,	(SELECT ISNULL(SUM(TCC.Sukces), 0)				FROM #TelefonyCC	AS TCC WHERE TCC.spr_ID = SB.spr_ID)	AS SukcesTel_CC
+	,	(SELECT ISNULL(SUM(WDT.Próby), 0)				FROM #WizytyDT		AS WDT WHERE WDT.spr_ID = SB.spr_ID)	AS ProbyWizyty_DT
+	,	(SELECT ISNULL(SUM(WDT.Dotarcie), 0)			FROM #WizytyDT		AS WDT WHERE WDT.spr_ID = SB.spr_ID)	AS DotarcieWizyty_DT
+	,	(SELECT ISNULL(SUM(WDT.Sukces), 0)				FROM #WizytyDT		AS WDT WHERE WDT.spr_ID = SB.spr_ID)	AS SukcesWizyty_DT
+	,	(SELECT ISNULL(COUNT(POB.ID_Sprawa), 0)			FROM #Pobory		AS POB WHERE POB.ID_Sprawa = SB.spr_ID) AS IloscPoborow
+	,	(SELECT ISNULL(SUM(POB.Wartosc), 0)				FROM #Pobory		AS POB WHERE POB.ID_Sprawa = SB.spr_ID) AS WartoscPoborow
+	,	(SELECT ISNULL(COUNT(WPL.pay_ID), 0)			FROM #Wplaty_7dni	AS WPL WHERE WPL.spr_ID = SB.spr_ID
+																						AND CzyWplata_7DniOdWB = 1) AS IloscWplat
+	,	(SELECT ISNULL(SUM(WPL.pay_PaymentAmount), 0)	FROM #Wplaty_7dni	AS WPL WHERE WPL.spr_ID = SB.spr_ID
+																						AND CzyWplata_7DniOdWB = 1) AS WartoscWplat
+	,	GETDATE() AS DataOdswiezeniaDanych
+--INTO	NaszaBaza.sec.ANA_TB_237390_DT_EfektywnoscDzialan
+FROM -- SELECT * FROM
+			  #SprawyBucket	AS SB
+--WHERE spr_CalyNumerSprawy = 'NOVUM_NEW/385/21'
+
+
+
+--------------------------------------------- BUDOWANIE RAPORTU POBORU WPŁAT PRZEZ DT WZGLĘDEM DPD POŻYCZKI ---------------------------------------------
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Tworzenie tabelii z harmonogramami - uwaga tabela zawiera duplikaty stąd trzeba dorobić mechanizm który wyciągnie unikatowe pozycje
+
+SELECT 
+		ContractNumber		AS NumerUmowy
+	,	spr_CalyNumerSprawy AS CałyNumerSprawy
+	,	Date				AS DataRaty	
+	,	Number				AS NumerRaty
+	,	Amount				AS KwotaRaty
+	,	IsPaid				AS CzyZaplacone
+	,	PaidDate			AS DataZaplaty
+	,	Dpd					AS DPD
+	,	ROW_NUMBER() OVER(PARTITION BY ContractNumber, number ORDER BY  ContractNumber, number ) AS RN
+INTO
+		#HarmonogramyDuplikatySWAN
+FROM
+			#Sprawy												AS SPR
+	JOIN	Baza_system.dbo._CF_ContractInstallments	AS CIS ON CIS.ContractNumber = SPR.NumerUmowy
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+
+SELECT
+		HDS.NumerUmowy
+	,	HDS.CałyNumerSprawy	
+	,	ISNULL(CONVERT(DATE, LAG(HDS.DataRaty, 1) OVER(PARTITION BY NumerUmowy ORDER BY NumerRaty)), DATEADD(m, -1, HDS.DataRaty))  AS DataRatyOd
+	,	CONVERT(DATE, HDS.DataRaty) AS DataRatyDo
+	,	HDS.NumerRaty
+	,	HDS.KwotaRaty
+	,	SUM(KwotaRaty) OVER(PARTITION BY NumerUmowy ORDER BY NumerRaty) AS SkumulowanaRata
+INTO	-- DROP TABLE #HarmonogramySWAN_KOLIBER	-- SELECT * FROM
+		#HarmonogramySWAN_KOLIBER --WHERE CałyNumerSprawy = 'NOVUM_NEW/130/9'
+FROM	
+		#HarmonogramyDuplikatySWAN AS HDS
+WHERE
+		RN = 1
+
+UNION ALL
+
+SELECT
+		AGR.agr_AgreementNumber					AS NumerUmowy
+	,	spr_CalyNumerSprawy						AS CałyNumerSprawy
+	,	ISNULL(CONVERT(DATE, LAG(INS.ins_InstallmentDate, 1) OVER(PARTITION BY AGR.agr_AgreementNumber	 ORDER BY INS.ins_Number)), DATEADD(m, -1, INS.ins_InstallmentDate))					AS DataRatyOd
+	,	CONVERT(DATE, INS.ins_InstallmentDate)	AS DataRaty
+	,	INS.ins_Number							AS NumerRaty
+	,	INS.ins_InstallmentValue				AS KwotaRaty
+	,	SUM(INS.ins_InstallmentValue) OVER(PARTITION BY AGR.agr_AgreementNumber	 ORDER BY INS.ins_Number	) AS SkumulowanaRata
+FROM
+			#Sprawy								AS SPR
+	JOIN	CF_Reports.dbo.CF_TB_Agreements		AS AGR WITH(NOLOCK) ON SPR.NumerUmowy = AGR.agr_AgreementNumber
+	JOIN	CF_Reports.dbo.CF_TB_Credits		AS CRE WITH(NOLOCK)	ON CRE.cre_SourceProductId = AGR.agr_ProductOnAgreementId
+	JOIN	CF_Reports.dbo.CF_TB_Installments	AS INS WITH(NOLOCK)	ON INS.ins_CreditId = CRE.cre_ID
+																	AND INS.ins_Active = 1
+--WHERE AGR.agr_AgreementNumber = 0006906280034
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Tabela z wpłatami
+
+SELECT
+		WPL.*
+	,	SUM(WPL.pay_PaymentAmount) OVER(PARTITION BY WPL.spr_CalyNumerSprawy ORDER BY pay_PaymentDate) AS SkumulowanaPlatnosc
+INTO	-- DROP TABLE #Wplaty	-- SELECT TOP 1000  * FROM
+		#Wplaty	--WHERE spr_CalyNumerSprawy = 'NOVUM_NEW/526/21'
+FROM	-- select * from 
+				#Sprawy								AS SPR
+	LEFT JOIN	NaszaBaza.novum.ANA_TB_227195_WplatyHK_obaSystemy AS WPL ON WPL.spr_CalyNumerSprawy = SPR.spr_CalyNumerSprawy
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Połączenie poborów gotówki z harmonogramiami i wpłatami
+
+SELECT 
+		POB.*
+	,	HSK.*
+	,	RAT.SkumulowanaPlatnosc
+	,	HSK.SkumulowanaRata - RAT.SkumulowanaPlatnosc AS Roznica
+	,	CASE
+			WHEN HSK.SkumulowanaRata - RAT.SkumulowanaPlatnosc <= 0
+			THEN 1
+			ELSE 0
+		END AS CzyZaplacona
+INTO	-- DROP TABLE #Pobory_z_harmonogramem	-- SELECT * FROM
+	#Pobory_z_harmonogramem --WHERE NumerSprawy = 'NOVUM_NEW/156/3' --AND Datapobrania = '2020-05-05'
+FROM
+	#Pobory AS POB
+	LEFT JOIN #HarmonogramySWAN_KOLIBER AS HSK ON POB.NumerSprawy = HSK.CałyNumerSprawy
+													AND POB.DataPobrania >= HSK.DataRatyDo
+	OUTER APPLY (	SELECT TOP 1 *
+					FROM #Wplaty AS WPL
+					WHERE 
+							WPL.spr_CalyNumerSprawy = POB.NumerSprawy
+						AND WPL.pay_PaymentDate < POB.DataPobrania
+					ORDER BY
+						WPL.pay_PaymentDate DESC
+				) AS RAT
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Na podstawie tabeli poborów z harmonogramiami dociągnąć do jakiś spraw pojechali DT
+
+SELECT 
+		POB.*
+	,	COALESCE(HAR_NZP.NumerRaty, HAR_ZAP.NumerRaty, HAR_PIE.NumerRaty)	AS NumerRaty
+	,	COALESCE(HAR_NZP.DataRatyDo, HAR_ZAP.DataRatyDo, HAR_PIE.DataRatyDo)AS DataRatyDo
+	,	COALESCE(HAR_NZP.NextRata, HAR_ZAP.NextRata, HAR_PIE.NextRata)		AS NextRata
+INTO  -- DROP TABLE #Pobory_przed_update
+	#Pobory_przed_update
+FROM 
+	#Pobory AS POB
+	OUTER APPLY (	SELECT TOP 1 *,  0 AS NextRata
+					FROM 
+						#Pobory_z_harmonogramem AS PZH
+					WHERE
+							PZH.CałyNumerSprawy = POB.NumerSprawy
+						AND PZH.DataPobrania = POB.DataPobrania
+						AND PZH.CzyZaplacona = 0
+					ORDER BY
+						PZH.DataRatyDo ASC
+				) AS HAR_NZP
+		OUTER APPLY (	SELECT TOP 1 *,  1 AS NextRata
+						FROM	-- SELECT * FROM 
+							#Pobory_z_harmonogramem AS PZH --WHERE PZH.CałyNumerSprawy ='NOVUM_NEW/449/16'
+						WHERE
+								PZH.CałyNumerSprawy = POB.NumerSprawy
+							AND PZH.DataPobrania = POB.DataPobrania
+							AND PZH.CzyZaplacona = 1
+						ORDER BY
+							PZH.DataRatyDo DESC
+				) AS HAR_ZAP
+		OUTER APPLY (	SELECT TOP 1 *, 0 AS NextRata
+						FROM 
+							#HarmonogramySWAN_KOLIBER AS HSK
+						WHERE 
+							HSK.CałyNumerSprawy = POB.NumerSprawy
+						ORDER BY
+							HSK.DataRatyDo ASC
+					) AS HAR_PIE	
+					
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- aktualizacja tabeli w przypadku rat zapłąconych w czasie lub przed czasem - raport ma pokazywać że DT pojechał do kolejnej raty
+
+UPDATE   POG
+SET    
+		POG.DataRatyDo = DAT.DataRatyDo
+	,	POG.NumerRaty = DAT.NumerRaty
+FROM -- SELECT * FROM
+	#Pobory_przed_update AS POG --WHERE NumerUmowy ='CC/000229767/001' ORDER BY DataPobrania
+	OUTER APPLY (	SELECT TOP 1 *
+					FROM -- SELECT * FROM
+							#HarmonogramySWAN_KOLIBER AS HSR
+					WHERE 
+							HSR.CałyNumerSprawy = POG.NumerSprawy
+						AND HSR.DataRatyDo > POG.DataRatyDo
+					ORDER BY 
+							HSR.DataRatyDo ASC
+				) AS DAT
+WHERE
+	POG.NextRata = 1
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- wyliczenie DPD 
+
+SELECT 
+		PPU.ID_Pracownika
+	,	PPU.DataPobrania
+	,	PPU.Zdarzenie
+	,	PPU.ID_Klienta
+	,	PPU.ID_Sprawa
+	,	PPU.NumerSprawy
+	,	PPU.Wartosc
+	,	PPU.NumerRaty
+	,	PPU.DataRatyDo
+	,	ISNULL(DATEDIFF(day, PPU.DataRatyDo, PPU.DataPobrania),0) AS DPD
+	,	ROW_NUMBER() OVER(PARTITION BY PPU.NumerSprawy, PPU.NumerRaty ORDER BY  PPU.NumerSprawy, PPU.DataPobrania )  AS KtoryRaz
+	,	GETDATE() AS DataOdswiezeniaDanych
+INTO
+	#Pobory_po_update
+FROM 
+	#Pobory_przed_update AS PPU
+--WHERE NumerSprawy = 'NOVUM_NEW/156/3'
+ORDER BY DataPobrania
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Dane do raportu
+
+TRUNCATE TABLE NaszaBaza.sec.ANA_TB_237390_DT_PoboryGotowki
+INSERT INTO		--	DROP TABLE	-- SELECT * FROM
+		NaszaBaza.sec.ANA_TB_237390_DT_PoboryGotowki --where CzyInnaSprawa = 1 --where NumerSprawy = 'NOVUM_NEW/686/20'
+
+SELECT
+		PPU.ID_Pracownika
+	,	PPU.DataPobrania
+	,	PPU.Zdarzenie
+	,	PPU.ID_Klienta
+	,	PPU.ID_Sprawa
+	,	PPU.NumerSprawy
+	,	PPU.Wartosc
+	,	PPU.NumerRaty
+	,	PPU.DataRatyDo
+	,	PPU.DPD
+	,	PPU.KtoryRaz
+	,	CASE
+			WHEN PPU.DPD < 0 THEN '<0'
+			WHEN PPU.DPD = 0 THEN '0'
+			WHEN PPU.DPD BETWEEN 1 AND 7 THEN '1-7'
+			WHEN PPU.DPD BETWEEN 8 AND 14 THEN '8-14'
+			WHEN PPU.DPD BETWEEN 15 AND 21 THEN '15-21'
+			WHEN PPU.DPD BETWEEN 22 AND 30 THEN '22-30'
+			ELSE '>30'
+		END AS Gr_DPD
+	,	CASE
+			WHEN EXISTS (	SELECT NULL 
+							FROM		-- SELECT TOP 10 * FROM
+										Baza_system.dbo._Sprawa			AS SPR
+								JOIN	Baza_system.dbo._DluznikWSprawie	AS DWS	WITH(NOLOCK) ON	DWS.dws_IDSprawa = SPR.spr_ID
+																						AND DWS.dws_IDStatusDluznikaWSprawie = 1
+							WHERE 
+									SPR.spr_CalyNumerSprawy <> PPU.NumerSprawy -- inna sprawa niż ta z raportu
+								AND DWS.dws_IDDluznik = PPU.ID_Klienta			-- połączenie po kliencie
+								AND SPR.spr_DataImportu <= PPU.DataPobrania		-- sprawy zaimportowane po wizycie
+								AND ISNULL(SPR.spr_DataZamkniecia, GETDATE()) >= PPU.DataPobrania	-- sprawy zamknięte przed wizytą
+						)
+			THEN 1
+			ELSE 0
+		END AS CzyInnaSprawa
+	,	PPU.DataOdswiezeniaDanych
+--INTO  NaszaBaza.sec.ANA_TB_237390_DT_PoboryGotowki
+FROM	-- SELECT * FROM	
+	#Pobory_po_update AS PPU
+--WHERE
+--	PPU.KtoryRaz = 1
+--	--AND PPU.NumerSprawy = 'NOVUM_NEW/339/7'
+
+
+--------------------------------------------- BUDOWANIE RAPORTU POBORU WIZYT DT WZGLĘDEM DPD POŻYCZKI ---------------------------------------------------
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- wizyty DT ALL
+
+SELECT  
+		SPR.*
+	,	CAST(wbu_Data AS date)  AS DataWizyty
+	,	CASE
+			WHEN wbu_PobranoGotowke > 0 THEN 'Pobór gotówki'
+			WHEN wbu_BylKontakt = 1		THEN 'Dotarcie do dluznik'
+			ELSE 'Brak dotarcia'
+		END AS EfektWizyty
+	,	wbu_BylKontakt
+	,	WBW.wbw_Nazwa	AS NazwaDT
+	,	WBR.wbr_Nazwa	AS Rejon
+INTO	-- DROP TABLE	-- SELECT * FROM
+	#WizytyDT_ALL
+FROM	-- SELECT TOP 10  * FROM
+				Baza_system.dbo._WBUstalenia				AS WBU 
+	INNER JOIN	Baza_system.dbo._WBUstalenia_Lista			AS WBL	ON WBU.wbu_IDUstalenie = WBL.wbu_ID
+	JOIN		Baza_system.dbo.DEL_SL_WB_RodzajUstalen			AS RUST ON RUST.rust_ID = WBL.wbu_IDRodzaj
+																				AND RUST.rust_ID = 1 -- wizyta
+	LEFT JOIN	Baza_system.dbo._Sprawa_WB					AS SWB	ON wbu_IDSprawaWB = swb_ID
+	LEFT JOIN	Baza_system.dbo._WBWindykatorBezposredni	AS WBW	ON wbu_IDWindykator = wbw_ID
+	LEFT JOIN	Baza_system.dbo._WBRejon					AS WBR	ON WBR.wbr_ID = WBW.wbw_IDWBRejon
+																				AND WBR.wbr_Usuniety = 0
+	JOIN		#Sprawy												AS SPR	ON SPR.spr_ID = swb_IDSprawa
+
+--	SELECT * FROM Baza_system.dbo._WBRejon WHERE wbr_Usuniety = 0
+--	SELECT * FROM Baza_system.dbo.DEL_SL_WB_JednostkaOrganizacyjna
+--	SELECT * FROM Baza_system.dbo._WBOddzial
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Połączenie poborów gotówki z harmonogramiami i wpłatami
+
+SELECT 
+		POB.*
+	,	HSK.DataRatyOd
+	,	HSK.DataRatyDo
+	,	HSK.NumerRaty
+	,	HSK.KwotaRaty
+	,	HSK.SkumulowanaRata
+	,	RAT.SkumulowanaPlatnosc
+	,	HSK.SkumulowanaRata - RAT.SkumulowanaPlatnosc AS Roznica
+	,	CASE
+			WHEN HSK.SkumulowanaRata - RAT.SkumulowanaPlatnosc <= 0
+			THEN 1
+			ELSE 0
+		END AS CzyZaplacona
+INTO	-- DROP TABLE 	-- SELECT * FROM
+	#Wizyty_DT_z_harmonogramem --WHERE NumerSprawy = 'NOVUM_NEW/156/3' --AND Datapobrania = '2020-05-05'
+FROM	-- SELECT * FROM
+	#WizytyDT_ALL AS POB
+	LEFT JOIN #HarmonogramySWAN_KOLIBER AS HSK ON POB.spr_CalyNumerSprawy = HSK.CałyNumerSprawy
+													AND POB.DataWizyty >= HSK.DataRatyDo
+	OUTER APPLY (	SELECT TOP 1 *
+					FROM #Wplaty AS WPL
+					WHERE 
+							WPL.spr_CalyNumerSprawy = POB.spr_CalyNumerSprawy
+						AND WPL.pay_PaymentDate < POB.DataWizyty
+					ORDER BY
+						WPL.pay_PaymentDate DESC
+				) AS RAT
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Na podstawie tabeli poborów z harmonogramiami dociągnąć do jakiś spraw pojechali DT
+
+SELECT 
+		POB.*
+	,	COALESCE(HAR_NZP.NumerRaty, HAR_ZAP.NumerRaty, HAR_PIE.NumerRaty)	AS NumerRaty
+	,	COALESCE(HAR_NZP.DataRatyDo, HAR_ZAP.DataRatyDo, HAR_PIE.DataRatyDo)AS DataRatyDo
+	,	COALESCE(HAR_NZP.NextRata, HAR_ZAP.NextRata, HAR_PIE.NextRata)		AS NextRata
+INTO  -- DROP TABLE	-- SELECT * FROM
+	#Wizyty_DT_przed_update
+FROM 
+	#WizytyDT_ALL AS POB
+	OUTER APPLY (	SELECT TOP 1 *,  0 AS NextRata
+					FROM 
+						#Wizyty_DT_z_harmonogramem AS PZH
+					WHERE
+							PZH.spr_CalyNumerSprawy = POB.spr_CalyNumerSprawy
+						AND PZH.DataWizyty = POB.DataWizyty
+						AND PZH.CzyZaplacona = 0
+					ORDER BY
+						PZH.DataRatyDo ASC
+				) AS HAR_NZP
+		OUTER APPLY (	SELECT TOP 1 *,  1 AS NextRata
+						FROM	-- SELECT * FROM 
+							#Wizyty_DT_z_harmonogramem AS PZH --WHERE PZH.CałyNumerSprawy ='NOVUM_NEW/449/16'
+						WHERE
+								PZH.spr_CalyNumerSprawy = POB.spr_CalyNumerSprawy
+							AND PZH.DataWizyty = POB.DataWizyty
+							AND PZH.CzyZaplacona = 1
+						ORDER BY
+							PZH.DataRatyDo DESC
+				) AS HAR_ZAP
+		OUTER APPLY (	SELECT TOP 1 *, 0 AS NextRata
+						FROM 
+							#HarmonogramySWAN_KOLIBER AS HSK
+						WHERE 
+							HSK.CałyNumerSprawy = POB.spr_CalyNumerSprawy
+						ORDER BY
+							HSK.DataRatyDo ASC
+					) AS HAR_PIE	
+					
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- aktualizacja tabeli w przypadku rat zapłąconych w czasie lub przed czasem - raport ma pokazywać że DT pojechał do kolejnej raty
+
+UPDATE   POG
+SET    
+		POG.DataRatyDo = DAT.DataRatyDo
+	,	POG.NumerRaty = DAT.NumerRaty
+FROM -- SELECT * FROM
+	#Wizyty_DT_przed_update AS POG --WHERE NumerUmowy ='CC/000229767/001' ORDER BY DataPobrania
+	OUTER APPLY (	SELECT TOP 1 *
+					FROM -- SELECT * FROM
+							#HarmonogramySWAN_KOLIBER AS HSR
+					WHERE 
+							HSR.CałyNumerSprawy = POG.spr_CalyNumerSprawy
+						AND HSR.DataRatyDo > POG.DataRatyDo
+					ORDER BY 
+							HSR.DataRatyDo ASC
+				) AS DAT
+WHERE
+	POG.NextRata = 1
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- wyliczenie DPD 
+
+SELECT 
+		PPU.*
+	,	ISNULL(DATEDIFF(day, PPU.DataRatyDo, PPU.DataWizyty),0) AS DPD
+	,	ROW_NUMBER() OVER(PARTITION BY PPU.spr_CalyNumerSprawy, PPU.NumerRaty ORDER BY  PPU.spr_CalyNumerSprawy, PPU.DataWizyty )  AS KtoryRaz
+	,	GETDATE() AS DataOdswiezeniaDanych
+INTO		-- SELECT * FROM
+	#Wizyty_DT_po_update
+FROM	-- SELECT * FROM
+	#Wizyty_DT_przed_update AS PPU
+--WHERE NumerSprawy = 'NOVUM_NEW/156/3'
+ORDER BY DataWizyty
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Połączenie poborów gotówki z harmonogramiami i wpłatami
+
+SELECT
+		PPU.spr_ID
+	,	PPU.spr_CalyNumerSprawy AS NumerSprawy
+	,	PPU.NumerUmowy
+	,	PPU.DataImportu			AS DataImportuSprawy
+	,	PPU.DataWizyty
+	,	PPU.EfektWizyty
+	,	PPU.NumerRaty
+	,	PPU.KtoryRaz
+	,	PPU.DataRatyDo
+	,	PPU.NazwaDT
+	,	PPU.Rejon
+	,	PPU.DPD
+	,	CASE
+			WHEN PPU.DPD < 0 THEN '<0'
+			WHEN PPU.DPD = 0 THEN '0'
+			WHEN PPU.DPD BETWEEN 1 AND 7 THEN '1-7'
+			WHEN PPU.DPD BETWEEN 8 AND 14 THEN '8-14'
+			WHEN PPU.DPD BETWEEN 15 AND 21 THEN '15-21'
+			WHEN PPU.DPD BETWEEN 22 AND 30 THEN '22-30'
+			ELSE '>30'
+		END AS Gr_DPD
+	,	PPU.DataOdswiezeniaDanych
+	,	DWS.dws_IDDluznik AS ID_Klienta
+INTO  #Wizyty_ID_klienta
+FROM	-- SELECT * FROM
+	#Wizyty_DT_po_update AS PPU
+	LEFT JOIN	Baza_system.dbo._DluznikWSprawie	AS DWS	WITH(NOLOCK) ON	DWS.dws_IDSprawa = PPU.spr_ID
+																				AND DWS.dws_IDStatusDluznikaWSprawie = 1
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Raport
+
+TRUNCATE TABLE NaszaBaza.sec.ANA_TB_237390_DT_SkutecznoscWizyt
+INSERT INTO		--DROP TABLE	-- SELECT * FROM
+		NaszaBaza.sec.ANA_TB_237390_DT_SkutecznoscWizyt --where CzyInnaSprawa = 1 --where NumerSprawy = 'NOVUM_NEW/686/20'
+
+SELECT 
+		PPU.*
+	,	CASE
+			WHEN EXISTS (	SELECT NULL 
+							FROM		-- SELECT TOP 10 * FROM
+										Baza_system.dbo._Sprawa			AS SPR
+								JOIN	Baza_system.dbo._DluznikWSprawie	AS DWS	WITH(NOLOCK) ON	DWS.dws_IDSprawa = SPR.spr_ID
+																						AND DWS.dws_IDStatusDluznikaWSprawie = 1
+							WHERE 
+									SPR.spr_CalyNumerSprawy <> PPU.NumerSprawy -- inna sprawa niż ta z raportu
+								AND DWS.dws_IDDluznik = PPU.ID_Klienta			-- połączenie po kliencie
+								AND SPR.spr_DataImportu <= PPU.DataWizyty		-- sprawy zaimportowane po wizycie
+								AND ISNULL(SPR.spr_DataZamkniecia, GETDATE()) >= PPU.DataWizyty	-- sprawy zamknięte przed wizytą
+						)
+			THEN 1
+			ELSE 0
+		END AS CzyInnaSprawa
+--INTO  
+--	NaszaBaza.sec.ANA_TB_237390_DT_SkutecznoscWizyt
+FROM
+	#Wizyty_ID_klienta AS PPU
